@@ -14,6 +14,7 @@ Features:
   - OU-based targeting (in addition to 'all' or comma-separated IDs)
   - CSV/JSON audit report of all actions taken
   - Progress indicator to prevent CloudShell idle timeout
+  - Graceful Ctrl+C handling with partial report saved
 
 Requirements:
   - Run from the management account or a delegated admin for Account Management
@@ -54,6 +55,8 @@ import boto3
 import csv
 import json
 import logging
+import os
+import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -70,10 +73,27 @@ BOTO_CONFIG = Config(
     max_pool_connections=25,
 )
 
-MAX_WORKERS = 10  # Parallel threads (stay under 5 TPS with retries)
 CONTACT_TYPES_ALL = ["BILLING", "OPERATIONS", "SECURITY"]
 
 logger = logging.getLogger("alt-contact-mgr")
+
+# Graceful shutdown flag
+_shutdown_requested = False
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def validate_account_id(account_id):
+    """Validate that an account ID is a 12-digit numeric string."""
+    return len(account_id) == 12 and account_id.isdigit()
+
+
+def deduplicate_accounts(accounts):
+    """Remove duplicate account IDs while preserving order."""
+    return list(dict.fromkeys(accounts))
 
 
 # ---------------------------------------------------------------------------
@@ -134,14 +154,22 @@ def get_current_contact(client, account_id, contact_type):
 
 
 def contact_matches(current, desired):
-    """Check if the current contact already matches the desired state."""
+    """
+    Check if the current contact already matches the desired state.
+    Comparison is whitespace-trimmed to avoid unnecessary updates from
+    trailing spaces in API responses.
+    """
     if current is None:
         return False
+
+    def normalize(val):
+        return val.strip() if isinstance(val, str) else val
+
     return (
-        current.get("EmailAddress") == desired.get("EmailAddress")
-        and current.get("Name") == desired.get("Name")
-        and current.get("PhoneNumber") == desired.get("PhoneNumber")
-        and current.get("Title") == desired.get("Title")
+        normalize(current.get("EmailAddress")) == normalize(desired.get("EmailAddress"))
+        and normalize(current.get("Name")) == normalize(desired.get("Name"))
+        and normalize(current.get("PhoneNumber")) == normalize(desired.get("PhoneNumber"))
+        and normalize(current.get("Title")) == normalize(desired.get("Title"))
     )
 
 
@@ -244,17 +272,25 @@ def process_list(client, account_id, contact_type):
 # ---------------------------------------------------------------------------
 
 
-def run_operation(action, accounts, contact_types, contact_info=None, force=False, dry_run=False):
+def run_operation(action, accounts, contact_types, contact_info=None, force=False, dry_run=False, max_workers=10):
     """
     Execute the chosen action across all accounts × contact types using a thread pool.
-    Returns a list of result dicts.
+    Returns a list of result dicts. Handles graceful shutdown on Ctrl+C.
     """
+    global _shutdown_requested
     client = boto3.client("account", config=BOTO_CONFIG)
     results = []
     total_tasks = len(accounts) * len(contact_types)
     completed = 0
 
     def worker(account_id, ctype):
+        if _shutdown_requested:
+            return {
+                "account_id": account_id,
+                "contact_type": ctype,
+                "status": "cancelled",
+                "reason": "shutdown_requested",
+            }
         if action == "update":
             return process_update(client, account_id, ctype, contact_info, force, dry_run)
         elif action == "delete":
@@ -265,47 +301,64 @@ def run_operation(action, accounts, contact_types, contact_info=None, force=Fals
     # Build task list
     tasks = [(acct, ctype) for acct in accounts for ctype in contact_types]
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_task = {
             executor.submit(worker, acct, ctype): (acct, ctype)
             for acct, ctype in tasks
         }
 
-        for future in as_completed(future_to_task):
-            acct, ctype = future_to_task[future]
-            completed += 1
+        try:
+            for future in as_completed(future_to_task):
+                acct, ctype = future_to_task[future]
+                completed += 1
 
-            try:
-                result = future.result()
-                results.append(result)
-                status_icon = {
-                    "updated": "✓",
-                    "deleted": "✓",
-                    "skipped": "─",
-                    "found": "•",
-                    "not_set": "○",
-                    "would_update": "~",
-                    "would_delete": "~",
-                }.get(result["status"], "?")
-                print(f"\r  [{completed}/{total_tasks}] {status_icon} {acct} [{ctype}]", end="", flush=True)
+                try:
+                    result = future.result()
+                    results.append(result)
+                    status_icon = {
+                        "updated": "✓",
+                        "deleted": "✓",
+                        "skipped": "─",
+                        "found": "•",
+                        "not_set": "○",
+                        "would_update": "~",
+                        "would_delete": "~",
+                        "cancelled": "⊘",
+                    }.get(result["status"], "?")
+                    print(f"\r  [{completed}/{total_tasks}] {status_icon} {acct} [{ctype}]", end="", flush=True)
 
-            except ClientError as e:
-                error_msg = str(e)
-                results.append({
-                    "account_id": acct,
-                    "contact_type": ctype,
-                    "status": "error",
-                    "error": error_msg,
-                })
-                print(f"\r  [{completed}/{total_tasks}] ✗ {acct} [{ctype}]: {error_msg}", end="", flush=True)
+                except ClientError as e:
+                    error_code = e.response["Error"]["Code"]
+                    error_msg = e.response["Error"]["Message"]
+                    results.append({
+                        "account_id": acct,
+                        "contact_type": ctype,
+                        "status": "error",
+                        "error": f"{error_code}: {error_msg}",
+                    })
+                    print(f"\r  [{completed}/{total_tasks}] ✗ {acct} [{ctype}]: {error_code}", end="", flush=True)
 
-            except Exception as e:
-                results.append({
-                    "account_id": acct,
-                    "contact_type": ctype,
-                    "status": "error",
-                    "error": str(e),
-                })
+                except Exception as e:
+                    results.append({
+                        "account_id": acct,
+                        "contact_type": ctype,
+                        "status": "error",
+                        "error": type(e).__name__,
+                    })
+
+        except KeyboardInterrupt:
+            _shutdown_requested = True
+            print("\n\n  ⚠️  Ctrl+C received — shutting down gracefully...")
+            print("  Waiting for in-flight operations to complete...")
+            executor.shutdown(wait=True, cancel_futures=True)
+            # Collect any remaining completed futures
+            for future in future_to_task:
+                if future.done() and future not in [f for f in future_to_task if future_to_task[f] in [(r.get("account_id"), r.get("contact_type")) for r in results]]:
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception:
+                        pass
 
     print()  # Newline after progress
     return results
@@ -316,13 +369,24 @@ def run_operation(action, accounts, contact_types, contact_info=None, force=Fals
 # ---------------------------------------------------------------------------
 
 
+def sanitize_csv_field(value):
+    """
+    Sanitize a field value for CSV export to prevent formula injection.
+    Prefixes fields starting with =, +, -, @, \\t, \\r with a single quote.
+    """
+    if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return f"'{value}"
+    return value
+
+
 def write_csv_report(results, output_path):
     """Write results to a CSV file for audit trail."""
     fieldnames = ["timestamp", "account_id", "contact_type", "status", "reason",
                   "name", "email", "phone", "title", "error"]
 
     with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore",
+                                quoting=csv.QUOTE_ALL)
         writer.writeheader()
         timestamp = datetime.now(timezone.utc).isoformat()
         for r in results:
@@ -336,10 +400,10 @@ def write_csv_report(results, output_path):
             }
             # Include contact details for list action
             if r.get("contact"):
-                row["name"] = r["contact"].get("Name", "")
-                row["email"] = r["contact"].get("EmailAddress", "")
-                row["phone"] = r["contact"].get("PhoneNumber", "")
-                row["title"] = r["contact"].get("Title", "")
+                row["name"] = sanitize_csv_field(r["contact"].get("Name", ""))
+                row["email"] = sanitize_csv_field(r["contact"].get("EmailAddress", ""))
+                row["phone"] = sanitize_csv_field(r["contact"].get("PhoneNumber", ""))
+                row["title"] = sanitize_csv_field(r["contact"].get("Title", ""))
             writer.writerow(row)
 
     return output_path
@@ -387,6 +451,7 @@ def print_summary(results, elapsed):
         "would_delete": ("  ~ Would delete (dry-run):", "\033[93m"),
         "found": ("  • Found:", "\033[0m"),
         "not_set": ("  ○ Not set:", "\033[90m"),
+        "cancelled": ("  ⊘ Cancelled (shutdown):", "\033[93m"),
         "error": ("  ✗ Errors:", "\033[91m"),
     }
 
@@ -454,8 +519,8 @@ Examples:
     parser.add_argument("--force", action="store_true",
                         help="Skip idempotency check — apply to all accounts without "
                              "checking current state first (halves API calls)")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
-                        help=f"Number of parallel threads (default: {MAX_WORKERS})")
+    parser.add_argument("--workers", type=int, default=10,
+                        help="Number of parallel threads (default: 10)")
     parser.add_argument("--output", choices=["csv", "json", "both", "none"], default="csv",
                         help="Report output format (default: csv)")
     parser.add_argument("--output-dir", type=str, default=".",
@@ -494,6 +559,12 @@ def main():
         print("  ⚡ FORCE MODE — skipping idempotency checks\n")
 
     # -----------------------------------------------------------------------
+    # Validate and create output directory
+    # -----------------------------------------------------------------------
+    if args.output != "none":
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    # -----------------------------------------------------------------------
     # Resolve target accounts
     # -----------------------------------------------------------------------
     org_client = boto3.client("organizations", config=BOTO_CONFIG)
@@ -507,15 +578,31 @@ def main():
         print(f"  Found {len(accounts)} active accounts in the organization")
     else:
         accounts = [a.strip() for a in args.accounts.split(",")]
-        # Validate
+
+        # Validate account ID format
+        invalid_format = [a for a in accounts if not validate_account_id(a)]
+        if invalid_format:
+            print(f"\n  ✗ ERROR: Invalid account ID format (must be 12 digits):")
+            for a in invalid_format:
+                print(f"      - '{a}'")
+            sys.exit(1)
+
+        # Validate membership in organization
         org_accounts = set(get_all_active_account_ids(org_client))
-        invalid = [a for a in accounts if a not in org_accounts]
-        if invalid:
+        not_in_org = [a for a in accounts if a not in org_accounts]
+        if not_in_org:
             print(f"\n  ✗ ERROR: These accounts are not in your organization:")
-            for a in invalid:
+            for a in not_in_org:
                 print(f"      - {a}")
             sys.exit(1)
+
         print(f"  Targeting {len(accounts)} specified accounts")
+
+    # Deduplicate
+    original_count = len(accounts)
+    accounts = deduplicate_accounts(accounts)
+    if len(accounts) < original_count:
+        print(f"  ℹ️  Removed {original_count - len(accounts)} duplicate account ID(s)")
 
     if not accounts:
         print("  No accounts found. Exiting.")
@@ -551,9 +638,6 @@ def main():
     # -----------------------------------------------------------------------
     # Execute
     # -----------------------------------------------------------------------
-    global MAX_WORKERS
-    MAX_WORKERS = args.workers
-
     tic = time.perf_counter()
     results = run_operation(
         action=args.action,
@@ -562,11 +646,12 @@ def main():
         contact_info=contact_info,
         force=args.force,
         dry_run=args.dry_run,
+        max_workers=args.workers,
     )
     elapsed = time.perf_counter() - tic
 
     # -----------------------------------------------------------------------
-    # Report
+    # Report (always attempt to save, even after Ctrl+C)
     # -----------------------------------------------------------------------
     print_summary(results, elapsed)
 
@@ -583,7 +668,10 @@ def main():
 
     # Exit code based on errors
     errors = [r for r in results if r.get("status") == "error"]
-    if errors:
+    if _shutdown_requested:
+        print(f"\n  ⚠️  Interrupted. Partial results ({len(results)}/{total_ops}) saved to report.")
+        sys.exit(130)
+    elif errors:
         print(f"\n  ⚠️  {len(errors)} operations failed. Check the report for details.")
         sys.exit(1)
 
