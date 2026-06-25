@@ -10,7 +10,7 @@ Features:
   - Concurrent execution (thread pool) for fast processing
   - Adaptive retry with exponential backoff (handles API throttling)
   - Dry-run mode to preview changes before applying
-  - Idempotency — skips accounts that already have the correct contact
+  - Idempotency — skips accounts that already have the correct contact (use --force to override)
   - OU-based targeting (in addition to 'all' or comma-separated IDs)
   - CSV/JSON audit report of all actions taken
   - Progress indicator to prevent CloudShell idle timeout
@@ -29,10 +29,10 @@ Usage examples:
       --name "Security Team" --email security@company.com \\
       --phone "+61-2-1234-5678" --title "Security Operations" --dry-run
 
-  # Apply for real
+  # Apply for real (skip idempotency check when you know contacts are unset)
   python3 aws_alternate_contact_manager.py update --accounts all --type security \\
       --name "Security Team" --email security@company.com \\
-      --phone "+61-2-1234-5678" --title "Security Operations"
+      --phone "+61-2-1234-5678" --title "Security Operations" --force
 
   # Target a specific OU
   python3 aws_alternate_contact_manager.py update --ou ou-abc1-23456789 --type security \\
@@ -81,11 +81,6 @@ logger = logging.getLogger("alt-contact-mgr")
 # ---------------------------------------------------------------------------
 
 
-def get_current_account_id():
-    """Return the AWS account ID of the caller."""
-    return boto3.client("sts").get_caller_identity()["Account"]
-
-
 def get_all_active_account_ids(org_client):
     """Paginate all ACTIVE account IDs in the organization."""
     paginator = org_client.get_paginator("list_accounts")
@@ -124,17 +119,14 @@ def get_accounts_for_ou(org_client, ou_id):
 # ---------------------------------------------------------------------------
 
 
-def get_current_contact(client, account_id, contact_type, current_account_id):
+def get_current_contact(client, account_id, contact_type):
     """Fetch the current alternate contact. Returns dict or None if not set."""
-    params = {"AlternateContactType": contact_type}
-    if account_id != current_account_id:
-        params["AccountId"] = account_id
-
     try:
-        resp = client.get_alternate_contact(**params)
-        contact = resp["AlternateContact"]
-        contact.pop("AlternateContactType", None)
-        return contact
+        resp = client.get_alternate_contact(
+            AccountId=account_id,
+            AlternateContactType=contact_type,
+        )
+        return resp["AlternateContact"]
     except ClientError as e:
         if e.response["Error"]["Code"] == "ResourceNotFoundException":
             return None
@@ -153,35 +145,43 @@ def contact_matches(current, desired):
     )
 
 
-def process_update(client, account_id, contact_type, contact_info, current_account_id, dry_run=False):
+def process_update(client, account_id, contact_type, contact_info, force=False, dry_run=False):
     """
     Update a single account+type. Returns a result dict.
-    Skips if already matching (idempotent).
+    Skips if already matching (idempotent) unless --force is set.
     """
-    params = {"AlternateContactType": contact_type}
-    if account_id != current_account_id:
-        params["AccountId"] = account_id
+    # Check current state for idempotency (skip if --force)
+    if not force:
+        current = get_current_contact(client, account_id, contact_type)
+        if contact_matches(current, contact_info):
+            return {
+                "account_id": account_id,
+                "contact_type": contact_type,
+                "status": "skipped",
+                "reason": "already_configured",
+            }
 
-    # Check current state for idempotency
-    current = get_current_contact(client, account_id, contact_type, current_account_id)
-    if contact_matches(current, contact_info):
-        return {
-            "account_id": account_id,
-            "contact_type": contact_type,
-            "status": "skipped",
-            "reason": "already_configured",
-        }
-
-    if dry_run:
+        if dry_run:
+            return {
+                "account_id": account_id,
+                "contact_type": contact_type,
+                "status": "would_update",
+                "current": current,
+            }
+    elif dry_run:
         return {
             "account_id": account_id,
             "contact_type": contact_type,
             "status": "would_update",
-            "current": current,
+            "current": None,
         }
 
     # Apply the update
-    client.put_alternate_contact(**params, **contact_info)
+    client.put_alternate_contact(
+        AccountId=account_id,
+        AlternateContactType=contact_type,
+        **contact_info,
+    )
     return {
         "account_id": account_id,
         "contact_type": contact_type,
@@ -189,31 +189,38 @@ def process_update(client, account_id, contact_type, contact_info, current_accou
     }
 
 
-def process_delete(client, account_id, contact_type, current_account_id, dry_run=False):
+def process_delete(client, account_id, contact_type, force=False, dry_run=False):
     """Delete a single account+type alternate contact."""
-    params = {"AlternateContactType": contact_type}
-    if account_id != current_account_id:
-        params["AccountId"] = account_id
+    # Check if it exists first (skip if --force)
+    if not force:
+        current = get_current_contact(client, account_id, contact_type)
+        if current is None:
+            return {
+                "account_id": account_id,
+                "contact_type": contact_type,
+                "status": "skipped",
+                "reason": "not_set",
+            }
 
-    # Check if it exists first
-    current = get_current_contact(client, account_id, contact_type, current_account_id)
-    if current is None:
-        return {
-            "account_id": account_id,
-            "contact_type": contact_type,
-            "status": "skipped",
-            "reason": "not_set",
-        }
-
-    if dry_run:
+        if dry_run:
+            return {
+                "account_id": account_id,
+                "contact_type": contact_type,
+                "status": "would_delete",
+                "current": current,
+            }
+    elif dry_run:
         return {
             "account_id": account_id,
             "contact_type": contact_type,
             "status": "would_delete",
-            "current": current,
+            "current": None,
         }
 
-    client.delete_alternate_contact(**params)
+    client.delete_alternate_contact(
+        AccountId=account_id,
+        AlternateContactType=contact_type,
+    )
     return {
         "account_id": account_id,
         "contact_type": contact_type,
@@ -221,9 +228,9 @@ def process_delete(client, account_id, contact_type, current_account_id, dry_run
     }
 
 
-def process_list(client, account_id, contact_type, current_account_id):
+def process_list(client, account_id, contact_type):
     """List the current alternate contact for an account+type."""
-    current = get_current_contact(client, account_id, contact_type, current_account_id)
+    current = get_current_contact(client, account_id, contact_type)
     return {
         "account_id": account_id,
         "contact_type": contact_type,
@@ -237,7 +244,7 @@ def process_list(client, account_id, contact_type, current_account_id):
 # ---------------------------------------------------------------------------
 
 
-def run_operation(action, accounts, contact_types, current_account_id, contact_info=None, dry_run=False):
+def run_operation(action, accounts, contact_types, contact_info=None, force=False, dry_run=False):
     """
     Execute the chosen action across all accounts × contact types using a thread pool.
     Returns a list of result dicts.
@@ -249,11 +256,11 @@ def run_operation(action, accounts, contact_types, current_account_id, contact_i
 
     def worker(account_id, ctype):
         if action == "update":
-            return process_update(client, account_id, ctype, contact_info, current_account_id, dry_run)
+            return process_update(client, account_id, ctype, contact_info, force, dry_run)
         elif action == "delete":
-            return process_delete(client, account_id, ctype, current_account_id, dry_run)
+            return process_delete(client, account_id, ctype, force, dry_run)
         elif action == "list":
-            return process_list(client, account_id, ctype, current_account_id)
+            return process_list(client, account_id, ctype)
 
     # Build task list
     tasks = [(acct, ctype) for acct in accounts for ctype in contact_types]
@@ -406,6 +413,10 @@ Examples:
   %(prog)s update --accounts all --type security \\
       --name "Sec Team" --email sec@co.com --phone "+1-555-0100" --title "SecOps" --dry-run
 
+  # Apply update, skip idempotency check (fastest for known-unset accounts)
+  %(prog)s update --accounts all --type security \\
+      --name "Sec Team" --email sec@co.com --phone "+1-555-0100" --title "SecOps" --force
+
   # Apply update to a specific OU
   %(prog)s update --ou ou-xxxx-yyyyyyyy --type security \\
       --name "Sec Team" --email sec@co.com --phone "+1-555-0100" --title "SecOps"
@@ -440,6 +451,9 @@ Examples:
     # Options
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview changes without applying them")
+    parser.add_argument("--force", action="store_true",
+                        help="Skip idempotency check — apply to all accounts without "
+                             "checking current state first (halves API calls)")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS,
                         help=f"Number of parallel threads (default: {MAX_WORKERS})")
     parser.add_argument("--output", choices=["csv", "json", "both", "none"], default="csv",
@@ -475,6 +489,9 @@ def main():
 
     if args.dry_run:
         print("  ⚠️  DRY-RUN MODE — no changes will be made\n")
+
+    if args.force:
+        print("  ⚡ FORCE MODE — skipping idempotency checks\n")
 
     # -----------------------------------------------------------------------
     # Resolve target accounts
@@ -512,7 +529,6 @@ def main():
     else:
         contact_types = [args.type.upper()]
 
-    current_account_id = get_current_account_id()
     total_ops = len(accounts) * len(contact_types)
     print(f"  Action: {args.action.upper()}")
     print(f"  Contact types: {', '.join(contact_types)}")
@@ -543,8 +559,8 @@ def main():
         action=args.action,
         accounts=accounts,
         contact_types=contact_types,
-        current_account_id=current_account_id,
         contact_info=contact_info,
+        force=args.force,
         dry_run=args.dry_run,
     )
     elapsed = time.perf_counter() - tic

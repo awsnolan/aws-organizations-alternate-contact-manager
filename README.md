@@ -93,12 +93,28 @@ usage: aws_alternate_contact_manager.py [-h] (--accounts ACCOUNTS | --ou OU)
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dry-run` | off | Preview changes without applying them |
+| `--force` | off | Skip idempotency check — apply without checking current state (halves API calls) |
 | `--workers N` | 10 | Number of parallel threads |
 | `--output {csv,json,both,none}` | csv | Report format |
 | `--output-dir PATH` | `.` | Directory for report files |
 | `--verbose` / `-v` | off | Enable debug logging |
 
 ## Examples
+
+### Fastest bulk update (skip idempotency check)
+
+When you know the contacts are unset (e.g. first-time setup across 500 accounts), use `--force` to skip the GET call before each PUT — halves the total API calls:
+
+```bash
+python3 aws_alternate_contact_manager.py update \
+    --accounts all \
+    --type security \
+    --name "Security Team" \
+    --email security@company.com \
+    --phone "+61-2-1234-5678" \
+    --title "Security Operations" \
+    --force
+```
 
 ### Update security contact for an entire OU
 
