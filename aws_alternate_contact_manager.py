@@ -23,6 +23,8 @@ Requirements:
   - IAM permissions: account:PutAlternateContact, account:GetAlternateContact,
     account:DeleteAlternateContact, organizations:ListAccounts,
     organizations:ListAccountsForParent, organizations:ListOrganizationalUnitsForParent
+    (sts:GetCallerIdentity is also called but requires no IAM permission)
+    See the README for a resource-scoped version of this policy.
 
 Usage examples:
   # Update security contact for ALL accounts (dry-run first)
@@ -96,9 +98,35 @@ def deduplicate_accounts(accounts):
     return list(dict.fromkeys(accounts))
 
 
+def contact_api_kwargs(account_id, contact_type, caller_account_id):
+    """
+    Build request kwargs for the Account Management alternate-contact APIs.
+
+    The calling account must NOT pass its own AccountId. The API requires the
+    operation to be made in "standalone context" by omitting the parameter,
+    which then defaults to the caller's own account. Passing it explicitly is
+    rejected. This applies to the management account, and omitting it is also
+    correct for a delegated administrator acting on its own account.
+
+    Because ListAccounts includes the management account, '--accounts all' run
+    from the management account always hits this case.
+
+    See: https://docs.aws.amazon.com/accounts/latest/APIReference/API_PutAlternateContact.html
+    """
+    kwargs = {"AlternateContactType": contact_type}
+    if account_id != caller_account_id:
+        kwargs["AccountId"] = account_id
+    return kwargs
+
+
 # ---------------------------------------------------------------------------
 # AWS helpers
 # ---------------------------------------------------------------------------
+
+
+def get_caller_account_id(sts_client):
+    """Return the 12-digit AWS account ID of the calling identity."""
+    return sts_client.get_caller_identity()["Account"]
 
 
 def get_all_active_account_ids(org_client):
@@ -139,12 +167,11 @@ def get_accounts_for_ou(org_client, ou_id):
 # ---------------------------------------------------------------------------
 
 
-def get_current_contact(client, account_id, contact_type):
+def get_current_contact(client, account_id, contact_type, caller_account_id):
     """Fetch the current alternate contact. Returns dict or None if not set."""
     try:
         resp = client.get_alternate_contact(
-            AccountId=account_id,
-            AlternateContactType=contact_type,
+            **contact_api_kwargs(account_id, contact_type, caller_account_id)
         )
         return resp["AlternateContact"]
     except ClientError as e:
@@ -173,92 +200,101 @@ def contact_matches(current, desired):
     )
 
 
-def process_update(client, account_id, contact_type, contact_info, force=False, dry_run=False):
+def process_update(client, account_id, contact_type, contact_info, caller_account_id,
+                   force=False, dry_run=False):
     """
     Update a single account+type. Returns a result dict.
+
     Skips if already matching (idempotent) unless --force is set.
+
+    Whenever the current state is read, it is recorded in the result under
+    "previous" so the audit report carries a recoverable before-state. Note
+    that --force skips that read to halve API calls, and therefore forfeits
+    the before-state for real (non-dry-run) applies.
+
+    A dry run always reads current state, even under --force, so that the
+    preview is never empty.
     """
-    # Check current state for idempotency (skip if --force)
-    if not force:
-        current = get_current_contact(client, account_id, contact_type)
-        if contact_matches(current, contact_info):
+    previous = None
+    read_current = dry_run or not force
+
+    if read_current:
+        previous = get_current_contact(client, account_id, contact_type, caller_account_id)
+        if not force and contact_matches(previous, contact_info):
             return {
                 "account_id": account_id,
                 "contact_type": contact_type,
                 "status": "skipped",
                 "reason": "already_configured",
+                "previous": previous,
             }
 
-        if dry_run:
-            return {
-                "account_id": account_id,
-                "contact_type": contact_type,
-                "status": "would_update",
-                "current": current,
-            }
-    elif dry_run:
+    if dry_run:
         return {
             "account_id": account_id,
             "contact_type": contact_type,
             "status": "would_update",
-            "current": None,
+            "previous": previous,
         }
 
     # Apply the update
     client.put_alternate_contact(
-        AccountId=account_id,
-        AlternateContactType=contact_type,
+        **contact_api_kwargs(account_id, contact_type, caller_account_id),
         **contact_info,
     )
     return {
         "account_id": account_id,
         "contact_type": contact_type,
         "status": "updated",
+        "previous": previous,
     }
 
 
-def process_delete(client, account_id, contact_type, force=False, dry_run=False):
-    """Delete a single account+type alternate contact."""
-    # Check if it exists first (skip if --force)
-    if not force:
-        current = get_current_contact(client, account_id, contact_type)
-        if current is None:
+def process_delete(client, account_id, contact_type, caller_account_id,
+                   force=False, dry_run=False):
+    """
+    Delete a single account+type alternate contact.
+
+    As with process_update, the deleted value is recorded under "previous" when
+    it was read, so the audit report retains what was removed. --force skips
+    that read and forfeits it.
+    """
+    previous = None
+    read_current = dry_run or not force
+
+    if read_current:
+        previous = get_current_contact(client, account_id, contact_type, caller_account_id)
+        if not force and previous is None:
             return {
                 "account_id": account_id,
                 "contact_type": contact_type,
                 "status": "skipped",
                 "reason": "not_set",
+                "previous": None,
             }
 
-        if dry_run:
-            return {
-                "account_id": account_id,
-                "contact_type": contact_type,
-                "status": "would_delete",
-                "current": current,
-            }
-    elif dry_run:
+    if dry_run:
         return {
             "account_id": account_id,
             "contact_type": contact_type,
             "status": "would_delete",
-            "current": None,
+            "previous": previous,
         }
 
     client.delete_alternate_contact(
-        AccountId=account_id,
-        AlternateContactType=contact_type,
+        **contact_api_kwargs(account_id, contact_type, caller_account_id)
     )
     return {
         "account_id": account_id,
         "contact_type": contact_type,
         "status": "deleted",
+        "previous": previous,
     }
 
 
-def process_list(client, account_id, contact_type):
+def process_list(client, account_id, contact_type, caller_account_id):
     """List the current alternate contact for an account+type."""
-    current = get_current_contact(client, account_id, contact_type)
+    current = get_current_contact(client, account_id, contact_type, caller_account_id)
     return {
         "account_id": account_id,
         "contact_type": contact_type,
@@ -272,7 +308,8 @@ def process_list(client, account_id, contact_type):
 # ---------------------------------------------------------------------------
 
 
-def run_operation(action, accounts, contact_types, contact_info=None, force=False, dry_run=False, max_workers=10):
+def run_operation(action, accounts, contact_types, caller_account_id, contact_info=None,
+                  force=False, dry_run=False, max_workers=10):
     """
     Execute the chosen action across all accounts × contact types using a thread pool.
     Returns a list of result dicts. Handles graceful shutdown on Ctrl+C.
@@ -292,11 +329,13 @@ def run_operation(action, accounts, contact_types, contact_info=None, force=Fals
                 "reason": "shutdown_requested",
             }
         if action == "update":
-            return process_update(client, account_id, ctype, contact_info, force, dry_run)
+            return process_update(client, account_id, ctype, contact_info,
+                                  caller_account_id, force, dry_run)
         elif action == "delete":
-            return process_delete(client, account_id, ctype, force, dry_run)
+            return process_delete(client, account_id, ctype, caller_account_id,
+                                  force, dry_run)
         elif action == "list":
-            return process_list(client, account_id, ctype)
+            return process_list(client, account_id, ctype, caller_account_id)
 
     # Build task list
     tasks = [(acct, ctype) for acct in accounts for ctype in contact_types]
@@ -382,7 +421,9 @@ def sanitize_csv_field(value):
 def write_csv_report(results, output_path):
     """Write results to a CSV file for audit trail."""
     fieldnames = ["timestamp", "account_id", "contact_type", "status", "reason",
-                  "name", "email", "phone", "title", "error"]
+                  "name", "email", "phone", "title",
+                  "previous_name", "previous_email", "previous_phone", "previous_title",
+                  "error"]
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore",
@@ -404,6 +445,12 @@ def write_csv_report(results, output_path):
                 row["email"] = sanitize_csv_field(r["contact"].get("EmailAddress", ""))
                 row["phone"] = sanitize_csv_field(r["contact"].get("PhoneNumber", ""))
                 row["title"] = sanitize_csv_field(r["contact"].get("Title", ""))
+            # Before-state for update/delete, so the report is a recovery source
+            if r.get("previous"):
+                row["previous_name"] = sanitize_csv_field(r["previous"].get("Name", ""))
+                row["previous_email"] = sanitize_csv_field(r["previous"].get("EmailAddress", ""))
+                row["previous_phone"] = sanitize_csv_field(r["previous"].get("PhoneNumber", ""))
+                row["previous_title"] = sanitize_csv_field(r["previous"].get("Title", ""))
             writer.writerow(row)
 
     return output_path
@@ -518,7 +565,10 @@ Examples:
                         help="Preview changes without applying them")
     parser.add_argument("--force", action="store_true",
                         help="Skip idempotency check — apply to all accounts without "
-                             "checking current state first (halves API calls)")
+                             "checking current state first (halves API calls). Note: "
+                             "this also means previous contact values are not recorded "
+                             "in the report. Ignored for --dry-run, which always reads "
+                             "current state.")
     parser.add_argument("--workers", type=int, default=10,
                         help="Number of parallel threads (default: 10)")
     parser.add_argument("--output", choices=["csv", "json", "both", "none"], default="csv",
@@ -556,7 +606,15 @@ def main():
         print("  ⚠️  DRY-RUN MODE — no changes will be made\n")
 
     if args.force:
-        print("  ⚡ FORCE MODE — skipping idempotency checks\n")
+        print("  ⚡ FORCE MODE — skipping idempotency checks")
+        if args.dry_run:
+            print("     (dry-run still reads current state so the preview is meaningful)\n")
+        elif args.action in ("update", "delete"):
+            print("     ⚠️  Current values will NOT be read, so the report will not")
+            print("         record what was overwritten. Drop --force if you want an")
+            print("         audit trail of previous contacts.\n")
+        else:
+            print()
 
     # -----------------------------------------------------------------------
     # Validate and create output directory
@@ -568,6 +626,16 @@ def main():
     # Resolve target accounts
     # -----------------------------------------------------------------------
     org_client = boto3.client("organizations", config=BOTO_CONFIG)
+
+    # The Account API rejects an explicit AccountId for the caller's own
+    # account, so we need to know who we are before issuing any calls.
+    try:
+        caller_account_id = get_caller_account_id(boto3.client("sts", config=BOTO_CONFIG))
+    except ClientError as e:
+        print(f"\n  ✗ ERROR: Could not determine the calling account: "
+              f"{e.response['Error']['Code']}")
+        sys.exit(1)
+    print(f"  Calling account: {caller_account_id}")
 
     print("  Resolving target accounts...")
     if args.ou:
@@ -643,6 +711,7 @@ def main():
         action=args.action,
         accounts=accounts,
         contact_types=contact_types,
+        caller_account_id=caller_account_id,
         contact_info=contact_info,
         force=args.force,
         dry_run=args.dry_run,

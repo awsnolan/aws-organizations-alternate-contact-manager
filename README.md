@@ -21,21 +21,71 @@ Bulk manage (list, update, delete) alternate contacts across all member accounts
    aws organizations enable-aws-service-access --service-principal account.amazonaws.com
    ```
 
-3. **IAM permissions** on the calling principal (management account or delegated admin):
+3. **IAM permissions** on the calling principal (management account or delegated admin).
+
+   Replace `111111111111` with your management account ID, `o-exampleorgid` with your
+   organization ID, and `r-exam` with your root ID:
+
    ```json
    {
-     "Effect": "Allow",
-     "Action": [
-       "account:PutAlternateContact",
-       "account:GetAlternateContact",
-       "account:DeleteAlternateContact",
-       "organizations:ListAccounts",
-       "organizations:ListAccountsForParent",
-       "organizations:ListOrganizationalUnitsForParent"
-     ],
-     "Resource": "*"
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "ListAllAccountsInOrg",
+         "Effect": "Allow",
+         "Action": "organizations:ListAccounts",
+         "Resource": "*"
+       },
+       {
+         "Sid": "ResolveOuMembership",
+         "Effect": "Allow",
+         "Action": [
+           "organizations:ListAccountsForParent",
+           "organizations:ListOrganizationalUnitsForParent"
+         ],
+         "Resource": [
+           "arn:aws:organizations::111111111111:root/o-exampleorgid/r-exam",
+           "arn:aws:organizations::111111111111:ou/o-exampleorgid/*"
+         ]
+       },
+       {
+         "Sid": "ManageAlternateContacts",
+         "Effect": "Allow",
+         "Action": [
+           "account:GetAlternateContact",
+           "account:PutAlternateContact",
+           "account:DeleteAlternateContact"
+         ],
+         "Resource": [
+           "arn:aws:account::111111111111:account",
+           "arn:aws:account::111111111111:account/o-exampleorgid/*"
+         ]
+       }
+     ]
    }
    ```
+
+   Notes on scoping:
+
+   - `organizations:ListAccounts` defines no resource types, so `"Resource": "*"` is the
+     only valid option for it. Every other action here can be scoped, and is.
+   - The bare `arn:aws:account::111111111111:account` entry is the *calling* account.
+     Omit it if this principal should not be able to change the management account's own
+     contacts, and keep only the `o-.../*` entry for member accounts.
+   - To restrict writes to part of the organization, add an
+     `account:AccountResourceOrgPaths` condition on the third statement. `--ou` is a
+     client-side flag, so IAM is the only place this can actually be enforced.
+   - To restrict which contact types a principal may touch, add an
+     `account:AlternateContactTypes` condition.
+   - `sts:GetCallerIdentity` is also called, but requires no IAM permission.
+
+   For read-only use (`list` action), grant only `organizations:ListAccounts`,
+   the two OU-resolution actions, and `account:GetAlternateContact`.
+
+   > This policy is derived from the [Account Management](https://docs.aws.amazon.com/service-authorization/latest/reference/list_account.html)
+   > and [Organizations](https://docs.aws.amazon.com/service-authorization/latest/reference/list_organizations.html)
+   > service authorization references. Validate it against your organization with IAM
+   > Access Analyzer before relying on it.
 
 ## Quick Start
 
@@ -63,13 +113,15 @@ python3 aws_alternate_contact_manager.py update --accounts all --type security \
 
 ```
 usage: aws_alternate_contact_manager.py [-h] (--accounts ACCOUNTS | --ou OU)
-                                         --type {billing,operations,security,all}
-                                         [--name NAME] [--email EMAIL]
-                                         [--phone PHONE] [--title TITLE]
-                                         [--dry-run] [--workers WORKERS]
-                                         [--output {csv,json,both,none}]
-                                         [--output-dir OUTPUT_DIR] [--verbose]
-                                         {list,update,delete}
+                                        --type
+                                        {billing,operations,security,all}
+                                        [--name NAME] [--email EMAIL]
+                                        [--phone PHONE] [--title TITLE]
+                                        [--dry-run] [--force]
+                                        [--workers WORKERS]
+                                        [--output {csv,json,both,none}]
+                                        [--output-dir OUTPUT_DIR] [--verbose]
+                                        {list,update,delete}
 ```
 
 ### Actions
@@ -92,8 +144,8 @@ usage: aws_alternate_contact_manager.py [-h] (--accounts ACCOUNTS | --ou OU)
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dry-run` | off | Preview changes without applying them |
-| `--force` | off | Skip idempotency check — apply without checking current state (halves API calls) |
+| `--dry-run` | off | Preview changes without applying them. Always reads current state, even with `--force`, so the preview shows what each account would change *from* |
+| `--force` | off | Skip idempotency check — apply without checking current state (halves API calls). **Also forfeits the audit before-state**: previous contact values cannot be recorded in the report because they are never read. Omit `--force` if you want a recovery record |
 | `--workers N` | 10 | Number of parallel threads |
 | `--output {csv,json,both,none}` | csv | Report format |
 | `--output-dir PATH` | `.` | Directory for report files |
@@ -103,7 +155,7 @@ usage: aws_alternate_contact_manager.py [-h] (--accounts ACCOUNTS | --ou OU)
 
 ### Fastest bulk update (skip idempotency check)
 
-When you know the contacts are unset (e.g. first-time setup across 500 accounts), use `--force` to skip the GET call before each PUT — halves the total API calls:
+When you know the contacts are unset (e.g. first-time setup across 500 accounts), use `--force` to skip the GET call before each PUT — halves the total API calls. Because nothing is read first, the report will not record previous values; that's an acceptable trade only when you know there's nothing to overwrite:
 
 ```bash
 python3 aws_alternate_contact_manager.py update \
@@ -175,6 +227,12 @@ The script produces a summary on completion:
 ```
 
 A CSV/JSON report is saved with per-account details for audit purposes.
+
+For `update` and `delete`, the report also records the values that were replaced or
+removed in `previous_name`, `previous_email`, `previous_phone`, and `previous_title`.
+Keep these reports — they are the only record of what a run overwrote, and the source
+you would restore from. They contain contact PII, so treat them accordingly; the
+included `.gitignore` keeps them out of version control.
 
 ## API Rate Limits
 
