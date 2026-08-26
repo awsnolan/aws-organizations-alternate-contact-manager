@@ -32,10 +32,12 @@ Usage examples:
       --name "Security Team" --email security@company.com \\
       --phone "+61-2-1234-5678" --title "Security Operations" --dry-run
 
-  # Apply for real (skip idempotency check when you know contacts are unset)
+  # Apply for real (skip idempotency check when you know contacts are unset).
+  # Org-wide runs exceed the default --max-changes ceiling, so state the scope.
   python3 aws_alternate_contact_manager.py update --accounts all --type security \\
       --name "Security Team" --email security@company.com \\
-      --phone "+61-2-1234-5678" --title "Security Operations" --force
+      --phone "+61-2-1234-5678" --title "Security Operations" --force \\
+      --max-changes 500
 
   # Target a specific OU
   python3 aws_alternate_contact_manager.py update --ou ou-abc1-23456789 --type security \\
@@ -77,6 +79,31 @@ BOTO_CONFIG = Config(
 
 CONTACT_TYPES_ALL = ["BILLING", "OPERATIONS", "SECURITY"]
 
+# Documented request rates for the Account Management API, which differ
+# substantially per operation. DeleteAlternateContact is the tightest by far.
+# https://docs.aws.amazon.com/accounts/latest/reference/quotas.html
+API_RATE_LIMITS = {
+    "GetAlternateContact": "10/sec, burst 15",
+    "PutAlternateContact": "5/sec, burst 8",
+    "DeleteAlternateContact": "1/sec, burst 6",
+}
+
+# Worker defaults are chosen per action against the rates above. Deletes are
+# limited to 1/sec sustained, so a high thread count there just buys backoff.
+DEFAULT_WORKERS = {"list": 10, "update": 10, "delete": 3}
+MAX_WORKERS_LIMIT = 50
+
+# Blast-radius ceiling on mutating runs. Exceeding it requires an explicit
+# --max-changes, which turns an org-wide overwrite into a deliberate act.
+DEFAULT_MAX_CHANGES = 50
+
+# Exit codes
+EXIT_OK = 0
+EXIT_ERRORS = 1
+EXIT_USAGE = 2
+EXIT_ABORTED = 3
+EXIT_INTERRUPTED = 130
+
 logger = logging.getLogger("alt-contact-mgr")
 
 # Graceful shutdown flag
@@ -91,6 +118,32 @@ _shutdown_requested = False
 def validate_account_id(account_id):
     """Validate that an account ID is a 12-digit numeric string."""
     return len(account_id) == 12 and account_id.isdigit()
+
+
+def worker_count(value):
+    """
+    argparse type for --workers. Clamps to a range that stays sane against the
+    documented API rates; unbounded thread counts only produce throttling.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"'{value}' is not an integer")
+    if not 1 <= n <= MAX_WORKERS_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and {MAX_WORKERS_LIMIT} (got {n})")
+    return n
+
+
+def non_negative_int(value):
+    """argparse type for --max-changes. 0 means no ceiling."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"'{value}' is not an integer")
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or greater (got {n})")
+    return n
 
 
 def deduplicate_accounts(accounts):
@@ -525,9 +578,11 @@ Examples:
   %(prog)s update --accounts all --type security \\
       --name "Sec Team" --email sec@co.com --phone "+1-555-0100" --title "SecOps" --dry-run
 
-  # Apply update, skip idempotency check (fastest for known-unset accounts)
+  # Apply update, skip idempotency check (fastest for known-unset accounts).
+  # --max-changes must cover the operation count for org-wide runs.
   %(prog)s update --accounts all --type security \\
-      --name "Sec Team" --email sec@co.com --phone "+1-555-0100" --title "SecOps" --force
+      --name "Sec Team" --email sec@co.com --phone "+1-555-0100" --title "SecOps" \\
+      --force --max-changes 500
 
   # Apply update to a specific OU
   %(prog)s update --ou ou-xxxx-yyyyyyyy --type security \\
@@ -569,8 +624,22 @@ Examples:
                              "this also means previous contact values are not recorded "
                              "in the report. Ignored for --dry-run, which always reads "
                              "current state.")
-    parser.add_argument("--workers", type=int, default=10,
-                        help="Number of parallel threads (default: 10)")
+    parser.add_argument("--workers", type=worker_count, default=None,
+                        metavar="N",
+                        help=f"Number of parallel threads, 1-{MAX_WORKERS_LIMIT}. "
+                             f"Defaults per action against the documented API rates: "
+                             f"list={DEFAULT_WORKERS['list']}, "
+                             f"update={DEFAULT_WORKERS['update']}, "
+                             f"delete={DEFAULT_WORKERS['delete']} "
+                             f"(DeleteAlternateContact is limited to "
+                             f"{API_RATE_LIMITS['DeleteAlternateContact']})")
+    parser.add_argument("--max-changes", type=non_negative_int,
+                        default=DEFAULT_MAX_CHANGES, metavar="N",
+                        help=f"Refuse to run if more than N write operations would be "
+                             f"performed (default: {DEFAULT_MAX_CHANGES}, 0 = no limit). "
+                             f"Applies to update and delete only; list and --dry-run are "
+                             f"exempt. Guards against targeting the whole organization "
+                             f"by accident.")
     parser.add_argument("--output", choices=["csv", "json", "both", "none"], default="csv",
                         help="Report output format (default: csv)")
     parser.add_argument("--output-dir", type=str, default=".",
@@ -634,7 +703,7 @@ def main():
     except ClientError as e:
         print(f"\n  ✗ ERROR: Could not determine the calling account: "
               f"{e.response['Error']['Code']}")
-        sys.exit(1)
+        sys.exit(EXIT_ERRORS)
     print(f"  Calling account: {caller_account_id}")
 
     print("  Resolving target accounts...")
@@ -653,7 +722,7 @@ def main():
             print(f"\n  ✗ ERROR: Invalid account ID format (must be 12 digits):")
             for a in invalid_format:
                 print(f"      - '{a}'")
-            sys.exit(1)
+            sys.exit(EXIT_USAGE)
 
         # Validate membership in organization
         org_accounts = set(get_all_active_account_ids(org_client))
@@ -662,7 +731,7 @@ def main():
             print(f"\n  ✗ ERROR: These accounts are not in your organization:")
             for a in not_in_org:
                 print(f"      - {a}")
-            sys.exit(1)
+            sys.exit(EXIT_USAGE)
 
         print(f"  Targeting {len(accounts)} specified accounts")
 
@@ -674,7 +743,7 @@ def main():
 
     if not accounts:
         print("  No accounts found. Exiting.")
-        sys.exit(0)
+        sys.exit(EXIT_OK)
 
     # -----------------------------------------------------------------------
     # Resolve contact types
@@ -685,11 +754,51 @@ def main():
         contact_types = [args.type.upper()]
 
     total_ops = len(accounts) * len(contact_types)
+
+    # Resolve worker count. Per-action defaults track the documented API rates;
+    # an explicit --workers is honoured but flagged if it outruns them.
+    if args.workers is None:
+        workers = DEFAULT_WORKERS[args.action]
+        workers_note = f" (default for {args.action})"
+    else:
+        workers = args.workers
+        workers_note = ""
+
     print(f"  Action: {args.action.upper()}")
     print(f"  Contact types: {', '.join(contact_types)}")
     print(f"  Total operations: {total_ops}")
-    print(f"  Parallel workers: {args.workers}")
+    print(f"  Parallel workers: {workers}{workers_note}")
+
+    if args.action == "delete" and workers > DEFAULT_WORKERS["delete"]:
+        print(f"     ⚠️  DeleteAlternateContact is limited to "
+              f"{API_RATE_LIMITS['DeleteAlternateContact']}. Extra threads above "
+              f"{DEFAULT_WORKERS['delete']} will mostly sit in retry backoff.")
     print()
+
+    # -----------------------------------------------------------------------
+    # Blast-radius ceiling (--max-changes)
+    #
+    # Enforced before any write is issued. Read-only actions and previews are
+    # exempt: 'list' changes nothing, and '--dry-run' is how you inspect scope.
+    # -----------------------------------------------------------------------
+    mutating = args.action in ("update", "delete")
+    if mutating and not args.dry_run and args.max_changes > 0 and total_ops > args.max_changes:
+        print(f"  ✗ ABORTED: this run would perform {total_ops} write operations,")
+        print(f"             above the --max-changes ceiling of {args.max_changes}.")
+        print()
+        print(f"             {len(accounts)} account(s) × {len(contact_types)} "
+              f"contact type(s) = {total_ops} writes")
+        print()
+        print("             Nothing has been changed. Review the scope first:")
+        print("                 --dry-run")
+        print()
+        print("             If this is intended, raise the ceiling explicitly:")
+        print(f"                 --max-changes {total_ops}")
+        print()
+        print("             Or narrow the target with --ou or an explicit "
+              "--accounts list.")
+        print()
+        sys.exit(EXIT_ABORTED)
 
     # -----------------------------------------------------------------------
     # Build contact info (for update)
@@ -715,7 +824,7 @@ def main():
         contact_info=contact_info,
         force=args.force,
         dry_run=args.dry_run,
-        max_workers=args.workers,
+        max_workers=workers,
     )
     elapsed = time.perf_counter() - tic
 
@@ -739,10 +848,10 @@ def main():
     errors = [r for r in results if r.get("status") == "error"]
     if _shutdown_requested:
         print(f"\n  ⚠️  Interrupted. Partial results ({len(results)}/{total_ops}) saved to report.")
-        sys.exit(130)
+        sys.exit(EXIT_INTERRUPTED)
     elif errors:
         print(f"\n  ⚠️  {len(errors)} operations failed. Check the report for details.")
-        sys.exit(1)
+        sys.exit(EXIT_ERRORS)
 
     print()
 

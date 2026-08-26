@@ -4,8 +4,8 @@ Bulk manage (list, update, delete) alternate contacts across all member accounts
 
 ## Features
 
-- **Fast** — Thread pool execution processes 500 accounts in under a minute
-- **Safe** — Dry-run mode previews all changes before applying
+- **Concurrent** — Thread pool execution, with worker defaults tuned per action against the documented API rate limits
+- **Safe** — Dry-run mode previews all changes before applying, a `--max-changes` ceiling blocks accidentally org-wide runs, and reports record the values that were replaced
 - **Idempotent** — Skips accounts that already have the correct contact configured
 - **Flexible targeting** — All accounts, specific account IDs, or by Organizational Unit (recursive)
 - **Audit trail** — Automatic CSV/JSON report of every action taken
@@ -101,13 +101,20 @@ python3 aws_alternate_contact_manager.py update --accounts all --type security \
     --title "Security Operations" \
     --dry-run
 
-# Apply for real
+# Apply for real. Org-wide runs exceed the default --max-changes ceiling of 50,
+# so the intended scope has to be stated explicitly — use the operation count
+# the dry-run reported.
 python3 aws_alternate_contact_manager.py update --accounts all --type security \
     --name "Security Team" \
     --email security@company.com \
     --phone "+61-2-1234-5678" \
-    --title "Security Operations"
+    --title "Security Operations" \
+    --max-changes 500
 ```
+
+The two-step shape is deliberate: preview with `--dry-run`, then re-run with a ceiling
+that matches what the preview reported. See
+[Guarding against over-broad runs](#guarding-against-over-broad-runs).
 
 ## Usage
 
@@ -146,7 +153,8 @@ usage: aws_alternate_contact_manager.py [-h] (--accounts ACCOUNTS | --ou OU)
 |------|---------|-------------|
 | `--dry-run` | off | Preview changes without applying them. Always reads current state, even with `--force`, so the preview shows what each account would change *from* |
 | `--force` | off | Skip idempotency check — apply without checking current state (halves API calls). **Also forfeits the audit before-state**: previous contact values cannot be recorded in the report because they are never read. Omit `--force` if you want a recovery record |
-| `--workers N` | 10 | Number of parallel threads |
+| `--workers N` | per action | Parallel threads, 1-50. Defaults: `list` 10, `update` 10, `delete` 3. See [API rate limits](#api-rate-limits) |
+| `--max-changes N` | 50 | Refuse to run if more than N writes would be performed. `0` disables. Applies to `update`/`delete`; `list` and `--dry-run` exempt |
 | `--output {csv,json,both,none}` | csv | Report format |
 | `--output-dir PATH` | `.` | Directory for report files |
 | `--verbose` / `-v` | off | Enable debug logging |
@@ -165,7 +173,8 @@ python3 aws_alternate_contact_manager.py update \
     --email security@company.com \
     --phone "+61-2-1234-5678" \
     --title "Security Operations" \
-    --force
+    --force \
+    --max-changes 500
 ```
 
 ### Update security contact for an entire OU
@@ -179,6 +188,9 @@ python3 aws_alternate_contact_manager.py update \
     --phone "+1-555-0100" \
     --title "Cloud Security Team"
 ```
+
+If the OU holds more than 50 accounts this will abort until you pass a matching
+`--max-changes`; the error message reports the exact count to use.
 
 ### List all alternate contacts and export to JSON
 
@@ -212,14 +224,15 @@ python3 aws_alternate_contact_manager.py delete \
 
 ## Output
 
-The script produces a summary on completion:
+The script produces a summary on completion (shape shown; elapsed time depends on
+account count, action, and how the API rate limits apply to your organization):
 
 ```
 ══════════════════════════════════════════════════════════════
   RESULTS SUMMARY
 ══════════════════════════════════════════════════════════════
   Total operations:  500
-  Time elapsed:      47.3s
+  Time elapsed:      <varies>
 ──────────────────────────────────────────────────────────────
   ✓ Updated: 483
   ─ Skipped (already correct): 17
@@ -234,13 +247,76 @@ Keep these reports — they are the only record of what a run overwrote, and the
 you would restore from. They contain contact PII, so treat them accordingly; the
 included `.gitignore` keeps them out of version control.
 
-## API Rate Limits
+## API rate limits
 
-The [AWS Account Management API](https://docs.aws.amazon.com/accounts/latest/reference/quotas.html) has a default quota of 5 transactions per second. The script uses:
-- **Adaptive retry mode** (exponential backoff) built into boto3
-- **10 parallel workers** (configurable via `--workers`)
+Rates differ substantially per operation — there is no single figure. From the
+[Account Management quotas](https://docs.aws.amazon.com/accounts/latest/reference/quotas.html):
 
-This combination handles throttling gracefully without manual sleep statements.
+| Operation | Rate | Burst |
+|---|---|---|
+| `GetAlternateContact` | 10/sec | 15 |
+| `PutAlternateContact` | 5/sec | 8 |
+| `DeleteAlternateContact` | **1/sec** | 6 |
+
+Delete is an order of magnitude tighter than the others, so worker defaults are set
+per action rather than globally:
+
+| Action | Default workers |
+|---|---|
+| `list` | 10 |
+| `update` | 10 |
+| `delete` | 3 |
+
+`--workers` accepts 1-50 and is validated. Raising it past the defaults for `delete`
+prints a warning, because threads above the sustained rate spend their time in retry
+backoff rather than doing work.
+
+Throttling is absorbed by boto3's **adaptive retry mode** (8 attempts, exponential
+backoff), so runs over the rate degrade in speed rather than failing.
+
+> Worker count is not a rate limiter. The quotas above are documented "per account",
+> and the docs distinguish that from "per caller account" elsewhere in the same table
+> without defining it for these operations — so whether the ceiling applies to the
+> calling principal or to each target account is unclear. If it is per caller,
+> concurrency past the sustained rate buys nothing. Measure against your own
+> organization before tuning `--workers` upward.
+
+## Guarding against over-broad runs
+
+`update` and `delete` refuse to run if they would perform more than `--max-changes`
+write operations (default **50**). The check happens before any write is issued.
+
+```
+  ✗ ABORTED: this run would perform 1500 write operations,
+             above the --max-changes ceiling of 50.
+
+             500 account(s) × 3 contact type(s) = 1500 writes
+
+             Nothing has been changed. Review the scope first:
+                 --dry-run
+
+             If this is intended, raise the ceiling explicitly:
+                 --max-changes 1500
+```
+
+This exists because `delete --accounts all --type all` is otherwise a single command
+that clears every alternate contact in the organization. `list` and `--dry-run` are
+exempt — neither changes anything, and `--dry-run` is how you inspect scope. Pass
+`--max-changes 0` to disable the ceiling entirely.
+
+Note that this is a client-side guard. To enforce scope in a way that cannot be
+bypassed by editing the script or calling the API directly, use the
+`account:AccountResourceOrgPaths` IAM condition described in the Prerequisites.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | One or more operations failed (see report) |
+| 2 | Usage error — bad account ID, account not in organization |
+| 3 | Aborted by the `--max-changes` ceiling; nothing was changed |
+| 130 | Interrupted with Ctrl+C; partial results saved to report |
 
 ## License
 
