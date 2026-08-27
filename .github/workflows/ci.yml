@@ -63,6 +63,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+
+      # The usage-block check imports the script to read --help, so the
+      # runtime dependency is required here too.
+      - run: pip install -r requirements.txt
 
       - name: README IAM policy is valid JSON
         run: |
