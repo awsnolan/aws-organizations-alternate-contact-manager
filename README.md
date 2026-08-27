@@ -14,6 +14,9 @@ Bulk manage (list, update, delete) alternate contacts across all member accounts
 
 ## Prerequisites
 
+0. **Python 3.9 or later**, with `boto3` available (both are preinstalled in CloudShell).
+   3.10+ is recommended — [boto3 dropped Python 3.9 support in April 2026](https://aws.amazon.com/blogs/developer/python-support-policy-updates-for-aws-sdks-and-tools/).
+
 1. **AWS Organizations with all features enabled** ([docs](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_org_support-all-features.html))
 
 2. **Trusted access enabled for Account Management**:
@@ -138,6 +141,19 @@ usage: aws_alternate_contact_manager.py [-h] (--accounts ACCOUNTS | --ou OU)
 | `list` | Display current alternate contacts across accounts |
 | `update` | Set or update alternate contacts (requires `--name`, `--email`, `--phone`, `--title`) |
 | `delete` | Remove alternate contacts from specified accounts |
+
+### Contact field limits
+
+`update` validates these locally before making any API call, so a malformed value fails
+once as a usage error rather than once per account mid-run. Limits are from the
+[`PutAlternateContact` reference](https://docs.aws.amazon.com/accounts/latest/APIReference/API_PutAlternateContact.html):
+
+| Flag | Max length | Accepted format |
+|------|-----------|-----------------|
+| `--email` | 254 | `user@example.com`; local part also allows `+ = . # \| ! & - _` |
+| `--name` | 64 | any |
+| `--phone` | 25 | digits, spaces, and `+ - ( )` only — no letters |
+| `--title` | 50 | any |
 
 ### Targeting accounts
 

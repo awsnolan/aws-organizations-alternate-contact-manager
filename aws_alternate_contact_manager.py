@@ -60,13 +60,23 @@ import csv
 import json
 import logging
 import os
-import signal
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+# ThreadPoolExecutor.shutdown(cancel_futures=...) is 3.9+, and it sits in the
+# Ctrl+C path — on an older interpreter an interrupt would raise there and lose
+# the partial report. Fail early and clearly instead.
+MIN_PYTHON = (3, 9)
+if sys.version_info < MIN_PYTHON:
+    sys.exit(
+        f"This script requires Python {'.'.join(map(str, MIN_PYTHON))} or later; "
+        f"found {'.'.join(map(str, sys.version_info[:3]))}."
+    )
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -96,6 +106,37 @@ MAX_WORKERS_LIMIT = 50
 # Blast-radius ceiling on mutating runs. Exceeding it requires an explicit
 # --max-changes, which turns an org-wide overwrite into a deliberate act.
 DEFAULT_MAX_CHANGES = 50
+
+# Documented constraints on the alternate contact fields. Checking these locally
+# turns "fails once per account across the whole organization" into a single
+# usage error before any API call is made.
+# https://docs.aws.amazon.com/accounts/latest/APIReference/API_PutAlternateContact.html
+CONTACT_FIELD_RULES = {
+    "email": {
+        "api_field": "EmailAddress",
+        "max_length": 254,
+        "pattern": r"[\s]*[\w+=.#|!&-]+@[\w.-]+\.[\w]+[\s]*",
+        "hint": "must look like user@example.com",
+    },
+    "name": {
+        "api_field": "Name",
+        "max_length": 64,
+        "pattern": None,
+        "hint": None,
+    },
+    "phone": {
+        "api_field": "PhoneNumber",
+        "max_length": 25,
+        "pattern": r"[\s0-9()+-]+",
+        "hint": "digits, spaces and + - ( ) only, e.g. +61-2-1234-5678",
+    },
+    "title": {
+        "api_field": "Title",
+        "max_length": 50,
+        "pattern": None,
+        "hint": None,
+    },
+}
 
 # Exit codes
 EXIT_OK = 0
@@ -133,6 +174,42 @@ def worker_count(value):
         raise argparse.ArgumentTypeError(
             f"must be between 1 and {MAX_WORKERS_LIMIT} (got {n})")
     return n
+
+
+def validate_contact_fields(values):
+    """
+    Check contact field values against the documented API constraints.
+
+    Returns a list of human-readable error strings; an empty list means valid.
+    The API applies these patterns as full matches, so re.fullmatch is used.
+
+    Without this, a malformed --name or --phone is only discovered by the API,
+    once per account, after the run has already started.
+    """
+    errors = []
+    for arg_name, rule in CONTACT_FIELD_RULES.items():
+        value = values.get(arg_name)
+        if value is None:
+            continue
+
+        label = f"--{arg_name}"
+        if not value:
+            errors.append(f"{label} must not be empty")
+            continue
+
+        if len(value) > rule["max_length"]:
+            errors.append(
+                f"{label} is {len(value)} characters; the API limit for "
+                f"{rule['api_field']} is {rule['max_length']}"
+            )
+
+        if rule["pattern"] and not re.fullmatch(rule["pattern"], value):
+            hint = f" — {rule['hint']}" if rule["hint"] else ""
+            errors.append(
+                f"{label} is not a format the API accepts{hint}"
+            )
+
+    return errors
 
 
 def non_negative_int(value):
@@ -654,6 +731,19 @@ Examples:
         missing = [f for f in ["name", "email", "phone", "title"] if not getattr(args, f)]
         if missing:
             parser.error(f"--{', --'.join(missing)} required for update action")
+
+        # Check field constraints now rather than per-account mid-run.
+        field_errors = validate_contact_fields({
+            "email": args.email,
+            "name": args.name,
+            "phone": args.phone,
+            "title": args.title,
+        })
+        if field_errors:
+            parser.error(
+                "contact field(s) rejected before any API call:\n  - "
+                + "\n  - ".join(field_errors)
+            )
 
     return args
 
