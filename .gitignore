@@ -1,4 +1,13 @@
-*.xlsx
-*.csv
+# Report artifacts. These contain contact PII (names, email addresses, phone
+# numbers) for every account in the organization — never commit them.
 alternate_contact_report_*
 *.csv
+*.xlsx
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
