@@ -1,0 +1,35 @@
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes — catches unused imports like the 'signal' one
+    "W",    # pycodestyle warnings
+    "I",    # import sorting
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter's line-length above
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.coverage.run]
+source = ["aws_alternate_contact_manager"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+# The uncovered remainder is mostly the KeyboardInterrupt path in
+# run_operation, which cannot be triggered deterministically, plus terminal
+# formatting. Raise this floor if that changes.
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
