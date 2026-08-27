@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Dummy credentials so that any call escaping a stub fails loudly here
+  # rather than reaching AWS. No real credentials are ever needed by this suite.
+  AWS_ACCESS_KEY_ID: testing
+  AWS_SECRET_ACCESS_KEY: testing
+  AWS_SESSION_TOKEN: testing
+  AWS_DEFAULT_REGION: us-east-1
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: ruff
+        run: ruff check .
+
+      - name: bandit
+        run: bandit -q -r aws_alternate_contact_manager.py
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the declared floor (ThreadPoolExecutor cancel_futures).
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: pytest
+        run: pytest --cov --cov-report=term-missing
+
+  verify-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # The usage-block check imports the script to read --help, so the
+      # runtime dependency is required here too.
+      - run: pip install -r requirements.txt
+
+      - name: README IAM policy is valid JSON
+        run: |
+          python - <<'PY'
+          import json, re, sys
+          blocks = re.findall(r"```json\n(.*?)```", open("README.md").read(), re.S)
+          if not blocks:
+              sys.exit("no JSON blocks found in README.md")
+          for i, block in enumerate(blocks):
+              json.loads(block)
+          print(f"{len(blocks)} JSON block(s) valid")
+          PY
+
+      - name: README usage block matches --help
+        run: |
+          python - <<'PY'
+          import re, subprocess, sys
+          help_text = subprocess.run(
+              [sys.executable, "aws_alternate_contact_manager.py", "--help"],
+              capture_output=True, text=True, check=True).stdout
+          actual = " ".join(help_text.split("\n\n")[0].split())
+          match = re.search(r"```\n(usage: .*?)```", open("README.md").read(), re.S)
+          if not match:
+              sys.exit("no usage block found in README.md")
+          documented = " ".join(match.group(1).split())
+          if documented != actual:
+              print("README usage block is out of date.\n")
+              print(f"documented: {documented}\n")
+              print(f"actual:     {actual}")
+              sys.exit(1)
+          print("usage block matches --help")
+          PY
+
+      - name: No real account identifiers committed
+        run: |
+          python - <<'PY'
+          import re, sys
+          ALLOWED = {"111111111111", "222222222222", "333333333333",
+                     "000000000000", "999999999999", "123456789012"}
+          bad = []
+          for path in ("README.md", "aws_alternate_contact_manager.py"):
+              for n, line in enumerate(open(path), 1):
+                  for match in re.findall(r"\b\d{12}\b", line):
+                      if match not in ALLOWED:
+                          bad.append(f"{path}:{n}: {match}")
+          if bad:
+              print("Possible real AWS account IDs found:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("no unexpected 12-digit identifiers")
+          PY

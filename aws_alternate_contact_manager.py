@@ -48,14 +48,14 @@ Usage examples:
   python3 aws_alternate_contact_manager.py list --accounts all --type security
 
   # Delete billing contact for specific accounts
-  python3 aws_alternate_contact_manager.py delete --accounts 111111111111,222222222222 --type billing
+  python3 aws_alternate_contact_manager.py delete \\
+      --accounts 111111111111,222222222222 --type billing
 
 Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 SPDX-License-Identifier: MIT-0
 """
 
 import argparse
-import boto3
 import csv
 import json
 import logging
@@ -65,6 +65,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+
+import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
@@ -169,7 +171,7 @@ def worker_count(value):
     try:
         n = int(value)
     except (TypeError, ValueError):
-        raise argparse.ArgumentTypeError(f"'{value}' is not an integer")
+        raise argparse.ArgumentTypeError(f"'{value}' is not an integer") from None
     if not 1 <= n <= MAX_WORKERS_LIMIT:
         raise argparse.ArgumentTypeError(
             f"must be between 1 and {MAX_WORKERS_LIMIT} (got {n})")
@@ -217,7 +219,7 @@ def non_negative_int(value):
     try:
         n = int(value)
     except (TypeError, ValueError):
-        raise argparse.ArgumentTypeError(f"'{value}' is not an integer")
+        raise argparse.ArgumentTypeError(f"'{value}' is not an integer") from None
     if n < 0:
         raise argparse.ArgumentTypeError(f"must be 0 or greater (got {n})")
     return n
@@ -494,7 +496,8 @@ def run_operation(action, accounts, contact_types, caller_account_id, contact_in
                         "would_delete": "~",
                         "cancelled": "⊘",
                     }.get(result["status"], "?")
-                    print(f"\r  [{completed}/{total_tasks}] {status_icon} {acct} [{ctype}]", end="", flush=True)
+                    print(f"\r  [{completed}/{total_tasks}] {status_icon} "
+                          f"{acct} [{ctype}]", end="", flush=True)
 
                 except ClientError as e:
                     error_code = e.response["Error"]["Code"]
@@ -505,7 +508,8 @@ def run_operation(action, accounts, contact_types, caller_account_id, contact_in
                         "status": "error",
                         "error": f"{error_code}: {error_msg}",
                     })
-                    print(f"\r  [{completed}/{total_tasks}] ✗ {acct} [{ctype}]: {error_code}", end="", flush=True)
+                    print(f"\r  [{completed}/{total_tasks}] ✗ {acct} "
+                          f"[{ctype}]: {error_code}", end="", flush=True)
 
                 except Exception as e:
                     results.append({
@@ -520,14 +524,35 @@ def run_operation(action, accounts, contact_types, caller_account_id, contact_in
             print("\n\n  ⚠️  Ctrl+C received — shutting down gracefully...")
             print("  Waiting for in-flight operations to complete...")
             executor.shutdown(wait=True, cancel_futures=True)
-            # Collect any remaining completed futures
-            for future in future_to_task:
-                if future.done() and future not in [f for f in future_to_task if future_to_task[f] in [(r.get("account_id"), r.get("contact_type")) for r in results]]:
-                    try:
-                        result = future.result()
-                        results.append(result)
-                    except Exception:
-                        pass
+
+            # as_completed was interrupted partway, so some futures may have
+            # finished without being recorded. Collect those, skipping tasks
+            # already in results and futures that were cancelled before
+            # starting. Failures are recorded rather than discarded: the exit
+            # code is derived from the error count, and a silently dropped
+            # failure would make an interrupted run look cleaner than it was.
+            recorded = {(r.get("account_id"), r.get("contact_type")) for r in results}
+            for future, task in future_to_task.items():
+                acct, ctype = task
+                if task in recorded or future.cancelled() or not future.done():
+                    continue
+                try:
+                    results.append(future.result())
+                except ClientError as e:
+                    results.append({
+                        "account_id": acct,
+                        "contact_type": ctype,
+                        "status": "error",
+                        "error": f"{e.response['Error']['Code']}: "
+                                 f"{e.response['Error']['Message']}",
+                    })
+                except Exception as e:
+                    results.append({
+                        "account_id": acct,
+                        "contact_type": ctype,
+                        "status": "error",
+                        "error": type(e).__name__,
+                    })
 
     print()  # Newline after progress
     return results
@@ -538,13 +563,38 @@ def run_operation(action, accounts, contact_types, caller_account_id, contact_in
 # ---------------------------------------------------------------------------
 
 
+# Characters that begin a spreadsheet formula outright.
+_CSV_FORMULA_PREFIXES = ("=", "@", "\t", "\r")
+
+# A leading + or - is ambiguous: it starts a formula, but it also starts every
+# E.164 phone number. Values made up only of these characters evaluate to a
+# number rather than a formula — no letters means no cell reference, no function
+# call, and no DDE — so they are safe to leave intact.
+_CSV_NUMERIC_SAFE = re.compile(r"[\s0-9()+-]+")
+
+
 def sanitize_csv_field(value):
     """
-    Sanitize a field value for CSV export to prevent formula injection.
-    Prefixes fields starting with =, +, -, @, \\t, \\r with a single quote.
+    Neutralise spreadsheet formula injection in an exported field.
+
+    Values starting with =, @, tab or CR are always prefixed with a single
+    quote. Values starting with + or - are prefixed only when they contain
+    something beyond digits, spaces and ()+-.
+
+    That exception exists because escaping every + would corrupt the phone
+    column, and the report is meant to be a recovery source: a restored
+    "'+15555550199" would be rejected by the API's PhoneNumber pattern. The
+    exception is safe because a formula needs characters the pattern excludes.
     """
-    if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+    if not isinstance(value, str) or not value:
+        return value
+
+    if value[0] in _CSV_FORMULA_PREFIXES:
         return f"'{value}"
+
+    if value[0] in ("+", "-") and not _CSV_NUMERIC_SAFE.fullmatch(value):
+        return f"'{value}"
+
     return value
 
 
@@ -614,7 +664,7 @@ def print_summary(results, elapsed):
     total = len(results)
 
     print(f"\n{'='*60}")
-    print(f"  RESULTS SUMMARY")
+    print("  RESULTS SUMMARY")
     print(f"{'='*60}")
     print(f"  Total operations:  {total}")
     print(f"  Time elapsed:      {elapsed:.1f}s")
@@ -809,7 +859,7 @@ def main():
         # Validate account ID format
         invalid_format = [a for a in accounts if not validate_account_id(a)]
         if invalid_format:
-            print(f"\n  ✗ ERROR: Invalid account ID format (must be 12 digits):")
+            print("\n  ✗ ERROR: Invalid account ID format (must be 12 digits):")
             for a in invalid_format:
                 print(f"      - '{a}'")
             sys.exit(EXIT_USAGE)
@@ -818,7 +868,7 @@ def main():
         org_accounts = set(get_all_active_account_ids(org_client))
         not_in_org = [a for a in accounts if a not in org_accounts]
         if not_in_org:
-            print(f"\n  ✗ ERROR: These accounts are not in your organization:")
+            print("\n  ✗ ERROR: These accounts are not in your organization:")
             for a in not_in_org:
                 print(f"      - {a}")
             sys.exit(EXIT_USAGE)
@@ -937,7 +987,8 @@ def main():
     # Exit code based on errors
     errors = [r for r in results if r.get("status") == "error"]
     if _shutdown_requested:
-        print(f"\n  ⚠️  Interrupted. Partial results ({len(results)}/{total_ops}) saved to report.")
+        print(f"\n  ⚠️  Interrupted. Partial results "
+              f"({len(results)}/{total_ops}) saved to report.")
         sys.exit(EXIT_INTERRUPTED)
     elif errors:
         print(f"\n  ⚠️  {len(errors)} operations failed. Check the report for details.")

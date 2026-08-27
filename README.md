@@ -127,8 +127,8 @@ usage: aws_alternate_contact_manager.py [-h] (--accounts ACCOUNTS | --ou OU)
                                         {billing,operations,security,all}
                                         [--name NAME] [--email EMAIL]
                                         [--phone PHONE] [--title TITLE]
-                                        [--dry-run] [--force]
-                                        [--workers WORKERS]
+                                        [--dry-run] [--force] [--workers N]
+                                        [--max-changes N]
                                         [--output {csv,json,both,none}]
                                         [--output-dir OUTPUT_DIR] [--verbose]
                                         {list,update,delete}
@@ -333,6 +333,40 @@ bypassed by editing the script or calling the API directly, use the
 | 2 | Usage error — bad account ID, account not in organization |
 | 3 | Aborted by the `--max-changes` ceiling; nothing was changed |
 | 130 | Interrupted with Ctrl+C; partial results saved to report |
+
+## Development
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+
+pytest                      # test suite with coverage floor
+ruff check .                # lint
+bandit -r aws_alternate_contact_manager.py
+```
+
+The suite uses `botocore.stub.Stubber`, which validates *exact outgoing request
+parameters* rather than resulting state. That matters most for the rule that the
+caller's own account must not receive an `AccountId` parameter — a test can assert
+the absence of a field directly. Dummy credentials are set for the whole session so
+that any call escaping a stub fails loudly instead of reaching AWS. No AWS account is
+needed to run the tests.
+
+CI runs lint, the suite across Python 3.9-3.13, and three documentation checks: that
+the IAM policy in this README is valid JSON, that the usage block above still matches
+`--help`, and that no unexpected 12-digit identifiers have been committed.
+
+### What the tests do not cover
+
+- Whether the organization has all-features and trusted access enabled
+- Real IAM evaluation — Stubber has no authorization layer, so the policy above is
+  unverified against a live organization
+- Actual throttling behaviour under the documented rate limits
+- The `KeyboardInterrupt` path in `run_operation`, which cannot be triggered
+  deterministically
+
+A run against a non-production organization is still the meaningful end-to-end check,
+particularly for the management-account path.
 
 ## License
 

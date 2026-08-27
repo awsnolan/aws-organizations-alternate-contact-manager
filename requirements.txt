@@ -1,0 +1,7 @@
+# Runtime dependency. Preinstalled in AWS CloudShell, so no install step is
+# needed there — this file exists for local and CI use.
+#
+# Pinned to a minimum rather than an exact version: the script uses only
+# long-stable Account Management and Organizations APIs, and pinning exactly
+# would hold back security updates in a tool run with org-admin credentials.
+boto3>=1.34.0
